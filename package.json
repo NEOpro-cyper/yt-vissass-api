@@ -4,17 +4,12 @@
   "description": "YouTube Download API — proxies vidssave.com with rotating proxy",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node server.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
-    "cors": "^2.8.6",
-    "express": "^4.22.2",
-    "https-proxy-agent": "^7.1.0",
-    "node-fetch": "^2.7.0"
+    "cors": "2.8.6",
+    "express": "4.22.2",
+    "https-proxy-agent": "7.0.6",
+    "node-fetch": "2.7.0"
   }
 }
