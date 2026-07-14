@@ -1,0 +1,20 @@
+{
+  "name": "yt-api-node",
+  "version": "1.0.0",
+  "description": "YouTube Download API — proxies vidssave.com with rotating proxy",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^4.22.2",
+    "https-proxy-agent": "^9.1.0",
+    "node-fetch": "^2.7.0"
+  }
+}
