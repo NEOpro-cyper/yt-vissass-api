@@ -1,16 +1,25 @@
 #!/usr/bin/env node
 /**
  * YouTube Download API — Node.js / Express
- *
+ * 
  * Proxies vidssave.com's backend to get direct download URLs
  * for YouTube videos at 1080P, 720P, 480P, 360P, and audio.
  *
  * Flow (reverse-engineered from vidssave.com):
  *   1. POST media/parse  → video info + resource list
+ *      - Some formats (360P, low audio) get direct googlevideo URLs
+ *      - Others (1080P, 720P, 480P) need a second request
  *   2. POST media/download with resource_content + no_encrypt=1 → task_id
- *   3. GET  media/download_query?task_id=… → download_link (redirect URL)
+ *   3. SSE  media/download_query?task_id=… → download_link (redirect URL)
  *
  * Uses Webshare rotating proxy to bypass IP blocks.
+ *
+ * Endpoints:
+ *   GET  /                        → API info
+ *   GET  /health                  → Health + proxy check
+ *   GET  /info?url=<YT_URL>       → Video metadata + all formats
+ *   GET  /download?url=<YT_URL>&quality=1080p  → Direct download URL
+ *   GET  /formats?url=<YT_URL>    → Quick format list (no download URLs)
  */
 
 const express = require('express');
@@ -18,7 +27,7 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
-// ─── Crash Guard ──────────────────────────────────────────────────────────────
+// ─── CRASH GUARD — keep server alive on errors ──────────────────────────────
 process.on('uncaughtException', (e) => {
   console.error('[UNCAUGHT]', e.stack || e.message || e);
 });
@@ -26,26 +35,15 @@ process.on('unhandledRejection', (e) => {
   console.error('[UNHANDLED REJECTION]', e);
 });
 
-// ─── Async Handler Wrapper for Express 4 ──────────────────────────────────────
-// Express 4 doesn't catch async errors — this wrapper ensures they're forwarded
-function asyncHandler(fn) {
-  return (req, res, next) => {
-    Promise.resolve(fn(req, res, next)).catch(err => {
-      console.error('[Route Error]', err.message);
-      if (!res.headersSent) {
-        res.status(502).json({ error: err.message });
-      }
-    });
-  };
-}
-
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8000;
 const PROXY_URL = process.env.PROXY_URL || 'http://qijlkvsz-rotate:viryx2zv5njj@p.webshare.io:80';
 const API_KEY = process.env.API_KEY || '';
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || '1800', 10); // 30 min
+const SSE_TIMEOUT = parseInt(process.env.SSE_TIMEOUT || '30000', 10); // 30s
 
 const VIDSSAVE_API = 'https://api.vidssave.com/api/contentsite_api';
+const VIDSSAVE_SSE = 'https://api.vidssave.com/sse/contentsite_api';
 const AUTH = '20250901majwlqo';
 const DOMAIN = 'api-ak.vidssave.com';
 
@@ -65,21 +63,8 @@ const BROWSER_HEADERS = {
 
 // ─── Proxy Agent ──────────────────────────────────────────────────────────────
 function getProxyAgent() {
+  // Create a fresh agent for each request to avoid connection reuse issues
   return new HttpsProxyAgent(PROXY_URL);
-}
-
-// ─── Fetch with Timeout ──────────────────────────────────────────────────────
-async function fetchWithTimeout(url, options, timeoutMs = 30000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const resp = await fetch(url, { ...options, signal: controller.signal });
-    clearTimeout(timer);
-    return resp;
-  } catch (err) {
-    clearTimeout(timer);
-    throw err;
-  }
 }
 
 // ─── In-Memory Cache ──────────────────────────────────────────────────────────
@@ -96,6 +81,7 @@ function cacheGet(key) {
 
 function cacheSet(key, data) {
   cache.set(key, { ts: Date.now(), data });
+  // Evict old
   const now = Date.now();
   for (const [k, v] of cache) {
     if (now - v.ts > CACHE_TTL * 2 * 1000) cache.delete(k);
@@ -140,84 +126,148 @@ function formatDuration(seconds) {
 
 // ─── vidssave API Calls ──────────────────────────────────────────────────────
 
+/**
+ * Step 1: Parse YouTube URL → video info + resource list
+ */
 async function vidssaveParse(ytUrl, retryCount = 3) {
   const body = new URLSearchParams({
-    auth: AUTH, domain: DOMAIN, origin: 'source', link: ytUrl,
+    auth: AUTH,
+    domain: DOMAIN,
+    origin: 'source',
+    link: ytUrl,
   }).toString();
 
   for (let attempt = 1; attempt <= retryCount; attempt++) {
     try {
-      const resp = await fetchWithTimeout(`${VIDSSAVE_API}/media/parse`, {
+      const ac = new AbortController();
+      const fetchTimer = setTimeout(() => ac.abort(), 30000);
+      const resp = await fetch(`${VIDSSAVE_API}/media/parse`, {
         method: 'POST',
-        headers: { ...BROWSER_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded' },
+        headers: {
+          ...BROWSER_HEADERS,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
         body,
         agent: getProxyAgent(),
-      }, 30000);
+        signal: ac.signal,
+      });
+      clearTimeout(fetchTimer);
 
       const data = await resp.json();
 
       if (data.status === 0 && data.status_code === 'analyze_risk') {
-        console.warn(`[parse] analyze_risk on attempt ${attempt}/${retryCount}`);
-        if (attempt < retryCount) { await new Promise(r => setTimeout(r, 1500)); continue; }
+        console.warn(`[parse] analyze_risk on attempt ${attempt}/${retryCount}, rotating proxy...`);
+        // Next attempt will use a fresh proxy agent automatically
+        if (attempt < retryCount) {
+          await new Promise(r => setTimeout(r, 1500));
+          continue;
+        }
       }
 
-      if (data.status === 1 || data.data) return data.data;
+      if (data.status === 1 || data.data) {
+        return data.data;
+      }
+
       throw new Error(data.msg || 'Parse failed');
     } catch (err) {
       if (attempt === retryCount) throw err;
-      console.warn(`[parse] Attempt ${attempt} failed: ${err.message}`);
+      console.warn(`[parse] Attempt ${attempt} failed: ${err.message}, retrying...`);
       await new Promise(r => setTimeout(r, 1500));
     }
   }
 }
 
+/**
+ * Step 2: Request download for a specific resource → task_id
+ */
 async function vidssaveDownload(resourceContent, retryCount = 3) {
-  const body = 'auth=' + AUTH + '&domain=' + DOMAIN +
-    '&request=' + encodeURIComponent(resourceContent) + '&no_encrypt=1';
+  const body = 'auth=' + AUTH +
+    '&domain=' + DOMAIN +
+    '&request=' + encodeURIComponent(resourceContent) +
+    '&no_encrypt=1';
 
   for (let attempt = 1; attempt <= retryCount; attempt++) {
     try {
-      const resp = await fetchWithTimeout(`${VIDSSAVE_API}/media/download`, {
+      const acDl = new AbortController();
+      const dlTimer = setTimeout(() => acDl.abort(), 60000);
+      const resp = await fetch(`${VIDSSAVE_API}/media/download`, {
         method: 'POST',
-        headers: { ...BROWSER_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded' },
+        headers: {
+          ...BROWSER_HEADERS,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': String(body.length),
+        },
         body,
         agent: getProxyAgent(),
-      }, 60000);
+        signal: acDl.signal,
+      });
+      clearTimeout(dlTimer);
 
       const data = await resp.json();
-      if (data.status === 1 && data.data && data.data.task_id) return data.data.task_id;
+      if (data.status === 1 && data.data?.task_id) {
+        return data.data.task_id;
+      }
       throw new Error(data.msg || 'Download request failed');
     } catch (err) {
       if (attempt === retryCount) throw err;
-      console.warn(`[download] Attempt ${attempt} failed: ${err.message}`);
+      console.warn(`[download] Attempt ${attempt} failed: ${err.message}, retrying...`);
       await new Promise(r => setTimeout(r, 1500));
     }
   }
 }
 
+/**
+ * Step 3: Poll for download link using HTTP GET (instead of SSE EventSource).
+ * The SSE endpoint can also be polled with regular GET — it returns the
+ * SSE text in the response body. This avoids Node.js stream issues.
+ */
 async function vidssaveQueryDownload(taskId) {
   const queryUrl = `${VIDSSAVE_API}/media/download_query?auth=${AUTH}&domain=${DOMAIN}&task_id=${encodeURIComponent(taskId)}&download_domain=vidssave.com&origin=content_site`;
 
-  for (let attempt = 1; attempt <= 15; attempt++) {
-    await new Promise(r => setTimeout(r, 2000));
-    try {
-      const resp = await fetchWithTimeout(queryUrl, {
-        headers: { ...BROWSER_HEADERS },
-        agent: getProxyAgent(),
-      }, 15000);
+  const maxAttempts = 15;
+  const delayMs = 2000;
 
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await new Promise(r => setTimeout(r, delayMs));
+
+    try {
+      const controller = new AbortController();
+      const fetchTimeout = setTimeout(() => controller.abort(), 15000);
+      
+      const resp = await fetch(queryUrl, {
+        headers: {
+          ...BROWSER_HEADERS,
+        },
+        agent: getProxyAgent(),
+        signal: controller.signal,
+      });
+
+      clearTimeout(fetchTimeout);
       const text = await resp.text();
 
+      // SSE format: "event: success\ndata: {json}\n\n"
+      // or sometimes just the raw JSON
       if (text.includes('download_link')) {
         const match = text.match(/"download_link"\s*:\s*"([^"]+)"/);
-        if (match) return { downloadLink: match[1], filesize: 0 };
+        if (match) {
+          return {
+            downloadLink: match[1],
+            filesize: 0,
+          };
+        }
+      }
 
-        try {
-          const json = JSON.parse(text);
-          if (json.data && json.data.download_link) {
-            return { downloadLink: json.data.download_link, filesize: json.data.filesize || 0 };
-          }
-        } catch (e) {}
+      // Try parsing as JSON directly
+      try {
+        const json = JSON.parse(text);
+        if (json.data && json.data.download_link) {
+          return {
+            downloadLink: json.data.download_link,
+            filesize: json.data.filesize || 0,
+          };
+        }
+      } catch (e) {
+        // Not JSON, continue polling
       }
 
       console.log(`[SSE poll] Attempt ${attempt}: no download_link yet`);
@@ -229,13 +279,27 @@ async function vidssaveQueryDownload(taskId) {
   throw new Error('SSE polling timed out — download link not received');
 }
 
+/**
+ * Get download URL for a specific quality.
+ * - If the parse response already has a direct URL (check_download), use it.
+ * - Otherwise, go through the download + SSE flow.
+ */
 async function getDownloadUrl(resource, retryCount = 2) {
+  // Direct URL already available
   if (resource.download_url && resource.download_mode === 'check_download') {
-    console.log(`[download] ${resource.quality} has direct URL`);
-    return { url: resource.download_url, filesize: resource.size || 0, isDirect: true, note: 'Direct Google video URL' };
+    console.log(`[download] ${resource.quality} has direct URL, returning`);
+    return {
+      url: resource.download_url,
+      filesize: resource.size || 0,
+      isDirect: true,
+      note: 'Direct Google video URL',
+    };
   }
 
-  if (!resource.resource_content) throw new Error(`No resource_content for ${resource.quality}`);
+  // Need to request download + poll SSE
+  if (!resource.resource_content) {
+    throw new Error(`No resource_content for ${resource.quality}`);
+  }
 
   for (let attempt = 1; attempt <= retryCount; attempt++) {
     try {
@@ -244,7 +308,12 @@ async function getDownloadUrl(resource, retryCount = 2) {
       console.log(`[download] Got task_id for ${resource.quality}, polling...`);
       const result = await vidssaveQueryDownload(taskId);
       console.log(`[download] Got download link for ${resource.quality}`);
-      return { url: result.downloadLink, filesize: result.filesize || resource.size || 0, isDirect: false, note: 'Vidssave redirect URL — follows to Google video server' };
+      return {
+        url: result.downloadLink,
+        filesize: result.filesize || resource.size || 0,
+        isDirect: false,
+        note: 'Vidssave redirect URL — follows to Google video server',
+      };
     } catch (err) {
       console.warn(`[download] ${resource.quality} attempt ${attempt} failed: ${err.message}`);
       if (attempt === retryCount) throw err;
@@ -253,10 +322,14 @@ async function getDownloadUrl(resource, retryCount = 2) {
   }
 }
 
+/**
+ * Full info fetch — parse + optionally get download URLs
+ */
 async function getVideoInfo(ytUrl, { includeUrls = false, quality = null } = {}) {
   const fullUrl = normalizeUrl(ytUrl);
   const videoId = extractVideoId(fullUrl);
 
+  // Check cache
   const cacheKey = `info:${fullUrl}`;
   const cached = cacheGet(cacheKey);
   let parsed;
@@ -268,29 +341,43 @@ async function getVideoInfo(ytUrl, { includeUrls = false, quality = null } = {})
     cacheSet(cacheKey, parsed);
   }
 
+  // Build response
   const resources = parsed.resources || [];
   const formats = resources.map(r => ({
-    quality: r.quality, type: r.type, format: r.format,
-    sizeBytes: r.size || 0, sizeMB: formatSize(r.size),
+    quality: r.quality,
+    type: r.type,
+    format: r.format,
+    sizeBytes: r.size || 0,
+    sizeMB: formatSize(r.size),
     hasDirectUrl: !!(r.download_url && r.download_mode === 'check_download'),
   }));
 
   const result = {
-    id: parsed.id || videoId, title: parsed.title,
-    thumbnail: parsed.thumbnail, durationSeconds: parsed.duration,
-    durationHms: formatDuration(parsed.duration), formats,
+    id: parsed.id || videoId,
+    title: parsed.title,
+    thumbnail: parsed.thumbnail,
+    durationSeconds: parsed.duration,
+    durationHms: formatDuration(parsed.duration),
+    formats,
   };
 
+  // If specific quality requested, get the download URL
   if (quality) {
+    const qualityUpper = quality.toUpperCase().replace('P', 'P');
     const qualityMap = {
-      '1080P':'1080P','720P':'720P','480P':'480P','360P':'360P',
-      '240P':'240P','144P':'144P','AUDIO':'128KBPS','MP3':'128KBPS',
-      'M4A':'128KBPS','128KBPS':'128KBPS','256KBPS':'256KBPS','48KBPS':'48KBPS',
+      '1080P': '1080P', '720P': '720P', '480P': '480P', '360P': '360P',
+      '240P': '240P', '144P': '144P',
+      'AUDIO': '128KBPS', 'MP3': '128KBPS', 'M4A': '128KBPS',
+      '128KBPS': '128KBPS', '256KBPS': '256KBPS', '48KBPS': '48KBPS',
     };
-    const targetQuality = qualityMap[quality.toUpperCase().replace('P','P')] || quality.toUpperCase();
+    const targetQuality = qualityMap[qualityUpper] || qualityUpper;
+
     const resource = resources.find(r => r.quality === targetQuality && r.type === 'video') ||
                      resources.find(r => r.quality === targetQuality && r.type === 'audio');
-    if (!resource) throw new Error(`Quality ${quality} not available. Available: ${resources.map(r => r.quality).join(', ')}`);
+
+    if (!resource) {
+      throw new Error(`Quality ${quality} not available. Available: ${resources.map(r => r.quality).join(', ')}`);
+    }
 
     const dlResult = await getDownloadUrl(resource);
     result.downloadUrl = dlResult.url;
@@ -299,6 +386,7 @@ async function getVideoInfo(ytUrl, { includeUrls = false, quality = null } = {})
     result.note = dlResult.note;
     result.requestedQuality = targetQuality;
 
+    // For video-only formats, also try to get audio URL
     if (resource.type === 'video' && targetQuality !== '360P') {
       const audioResource = resources.find(r => r.quality === '128KBPS' && r.type === 'audio');
       if (audioResource) {
@@ -313,12 +401,17 @@ async function getVideoInfo(ytUrl, { includeUrls = false, quality = null } = {})
     }
   }
 
+  // If includeUrls, get all download URLs
   if (includeUrls && !quality) {
     result.downloadUrls = {};
     for (const r of resources) {
       try {
         const dlResult = await getDownloadUrl(r);
-        result.downloadUrls[r.quality] = { url: dlResult.url, sizeMB: formatSize(dlResult.filesize), isDirect: dlResult.isDirect };
+        result.downloadUrls[r.quality] = {
+          url: dlResult.url,
+          sizeMB: formatSize(dlResult.filesize),
+          isDirect: dlResult.isDirect,
+        };
       } catch (e) {
         result.downloadUrls[r.quality] = { error: e.message };
       }
@@ -332,7 +425,9 @@ async function getVideoInfo(ytUrl, { includeUrls = false, quality = null } = {})
 function requireApiKey(req, res, next) {
   if (!API_KEY) return next();
   const key = req.headers['x-api-key'];
-  if (key !== API_KEY) return res.status(401).json({ error: 'Invalid API key' });
+  if (key !== API_KEY) {
+    return res.status(401).json({ error: 'Invalid API key' });
+  }
   next();
 }
 
@@ -341,7 +436,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ─── Routes (all wrapped with asyncHandler for Express 4 compatibility) ──────
+// ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
   res.json({
@@ -363,88 +458,129 @@ app.get('/', (req, res) => {
   });
 });
 
-app.get('/health', asyncHandler(async (req, res) => {
+app.get('/health', async (req, res) => {
+  let proxyOk = false;
+  let proxyIp = 'unknown';
   try {
-    const resp = await fetchWithTimeout(`${VIDSSAVE_API}/media/parse`, {
+    const acH = new AbortController();
+    const hTimer = setTimeout(() => acH.abort(), 15000);
+    const resp = await fetch('https://api.vidssave.com/api/contentsite_api/media/parse', {
       method: 'POST',
-      headers: { ...BROWSER_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: {
+        ...BROWSER_HEADERS,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
       body: new URLSearchParams({ auth: AUTH, domain: DOMAIN, origin: 'source', link: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' }).toString(),
       agent: getProxyAgent(),
-    }, 15000);
+      signal: acH.signal,
+    });
+    clearTimeout(hTimer);
     const data = await resp.json();
-    const proxyOk = data.status === 1 || !!data.data;
-    res.json({
-      status: proxyOk ? 'ok' : 'degraded',
-      proxy: PROXY_URL.split('@')[1] || PROXY_URL,
-      proxyWorking: proxyOk,
-      cacheSize: cache.size,
-      uptime: process.uptime(),
-    });
+    proxyOk = data.status === 1 || !!data.data;
   } catch (e) {
-    res.json({
-      status: 'degraded',
-      proxy: PROXY_URL.split('@')[1] || PROXY_URL,
-      proxyWorking: false,
-      error: e.message,
-      cacheSize: cache.size,
-      uptime: process.uptime(),
-    });
+    proxyOk = false;
   }
-}));
 
-app.get('/info', requireApiKey, asyncHandler(async (req, res) => {
+  res.json({
+    status: proxyOk ? 'ok' : 'degraded',
+    proxy: PROXY_URL.split('@')[1] || PROXY_URL,
+    proxyWorking: proxyOk,
+    cacheSize: cache.size,
+    uptime: process.uptime(),
+  });
+});
+
+app.get('/info', requireApiKey, async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: 'Missing ?url= parameter' });
+
   const videoId = extractVideoId(url);
   if (!videoId) return res.status(400).json({ error: 'Invalid YouTube URL or video ID' });
 
-  const info = await getVideoInfo(url, { includeUrls: false });
-  res.json(info);
-}));
+  try {
+    const info = await getVideoInfo(url, { includeUrls: false });
+    res.json(info);
+  } catch (err) {
+    console.error('[/info] Error:', err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
 
-app.get('/formats', requireApiKey, asyncHandler(async (req, res) => {
+app.get('/formats', requireApiKey, async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: 'Missing ?url= parameter' });
+
   const videoId = extractVideoId(url);
   if (!videoId) return res.status(400).json({ error: 'Invalid YouTube URL or video ID' });
 
-  const info = await getVideoInfo(url, { includeUrls: false });
-  res.json({ id: info.id, title: info.title, duration: info.durationHms, formats: info.formats });
-}));
+  try {
+    const info = await getVideoInfo(url, { includeUrls: false });
+    res.json({
+      id: info.id,
+      title: info.title,
+      duration: info.durationHms,
+      formats: info.formats,
+    });
+  } catch (err) {
+    console.error('[/formats] Error:', err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
 
-app.get('/download', requireApiKey, asyncHandler(async (req, res) => {
+app.get('/download', requireApiKey, async (req, res) => {
   const { url, quality = '1080p' } = req.query;
   if (!url) return res.status(400).json({ error: 'Missing ?url= parameter' });
+
   const videoId = extractVideoId(url);
   if (!videoId) return res.status(400).json({ error: 'Invalid YouTube URL or video ID' });
 
   console.log('[/download] Request:', quality, 'for', videoId);
 
-  const info = await getVideoInfo(url, { quality });
-  console.log('[/download] Got info, sending response');
-  res.json({
-    id: info.id, title: info.title, duration: info.durationHms,
-    quality: info.requestedQuality, downloadUrl: info.downloadUrl,
-    audioUrl: info.audioUrl || null, sizeMB: info.downloadSizeMB,
-    isDirectUrl: info.isDirectUrl, note: info.note,
-    audioNote: info.audioNote || null,
-    mergeTip: info.audioUrl ? 'ffmpeg -i video.mp4 -i audio.mp3 -c copy output.mp4' : null,
-  });
-  console.log('[/download] Response sent for', quality);
-}));
+  try {
+    const info = await getVideoInfo(url, { quality });
+    console.log('[/download] Got info, sending response');
+    res.json({
+      id: info.id,
+      title: info.title,
+      duration: info.durationHms,
+      quality: info.requestedQuality,
+      downloadUrl: info.downloadUrl,
+      audioUrl: info.audioUrl || null,
+      sizeMB: info.downloadSizeMB,
+      isDirectUrl: info.isDirectUrl,
+      note: info.note,
+      audioNote: info.audioNote || null,
+      mergeTip: info.audioUrl
+        ? 'ffmpeg -i video.mp4 -i audio.mp3 -c copy output.mp4'
+        : null,
+    });
+    console.log('[/download] Response sent for', quality);
+  } catch (err) {
+    console.error('[/download] Error:', err.message);
+    if (!res.headersSent) {
+      res.status(502).json({ error: err.message });
+    }
+  }
+});
 
-app.get('/all-urls', requireApiKey, asyncHandler(async (req, res) => {
+app.get('/all-urls', requireApiKey, async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: 'Missing ?url= parameter' });
+
   const videoId = extractVideoId(url);
   if (!videoId) return res.status(400).json({ error: 'Invalid YouTube URL or video ID' });
 
-  const info = await getVideoInfo(url, { includeUrls: true });
-  res.json(info);
-}));
+  try {
+    const info = await getVideoInfo(url, { includeUrls: true });
+    res.json(info);
+  } catch (err) {
+    console.error('[/all-urls] Error:', err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
 
 // ─── Start Server ─────────────────────────────────────────────────────────────
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   const proxyHost = PROXY_URL.includes('@') ? PROXY_URL.split('@')[1] : PROXY_URL;
   console.log('=== YouTube Download API (Node.js) ===');
   console.log('Port:', PORT);
@@ -453,6 +589,11 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('Ready!');
 });
 
-// Keep the Node.js event loop alive — without this, the process exits
-// when there are no active handles (proxy agent sockets close after requests)
+// Keep process alive
 setInterval(() => {}, 60000);
+
+
+
+
+
+
