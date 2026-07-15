@@ -1,15 +1,23 @@
 #!/usr/bin/env node
 /**
- * YouTube Download API — Node.js / Express
+ * YouTube Download API — Node.js / Express v3
  *
- * Reverse-engineered from vidssave.com — uses their API directly.
+ * Mirrors vidssave.com's actual frontend flow:
  *
- * Flow:
- *   1. POST media/parse → video info + all formats + some direct URLs
- *      - 360P, 128KBPS audio → direct googlevideo URLs (instant)
- *      - 1080P, 720P, 480P → need step 2+3
- *   2. POST media/download with resource_content → task_id
- *   3. GET  media/download_query?task_id=… → SSE stream → download_link
+ *   Step 1: /parse?url=<YT_URL>  (FAST ~1-2s)
+ *     → Returns all formats. Some already have direct downloadUrl (360P, audio).
+ *     → Non-direct formats return a resourceContent token instead.
+ *
+ *   Step 2: /resolve?rc=<resourceContent>  (~4-7s)
+ *     → Takes the resourceContent from Step 1, does download+SSE flow.
+ *     → Returns the final downloadUrl.
+ *
+ *   One-shot: /download?url=<YT_URL>&quality=1080p
+ *     → Does both steps internally. Slower but single request.
+ *
+ *   Stream: /stream?url=<YT_URL>&quality=1080p&filename=video.mp4
+ *     → Does parse + resolve + download through proxy + stream back.
+ *     → vidssave CDN URLs are IP-bound to proxy, so only this endpoint can download them.
  *
  * Uses Webshare rotating proxy to bypass IP blocks.
  */
@@ -144,11 +152,10 @@ async function vidssaveDownload(resourceContent) {
   throw new Error(data.msg || 'Download request failed');
 }
 
-/** Step 3: Read SSE stream → download_link (reads stream directly, no polling delay) */
+/** Step 3: Read SSE stream → download_link */
 async function vidssaveQueryDownload(taskId) {
   const queryUrl = `${VIDSSAVE_API}/media/download_query?auth=${AUTH}&domain=${DOMAIN}&task_id=${encodeURIComponent(taskId)}&download_domain=vidssave.com&origin=content_site`;
 
-  // Strategy 1: Read the SSE stream directly (fastest — like the browser)
   try {
     const resp = await fetchWithTimeout(queryUrl, {
       headers: { ...BROWSER_HEADERS },
@@ -167,7 +174,6 @@ async function vidssaveQueryDownload(taskId) {
     console.warn('[SSE stream] failed:', err.message);
   }
 
-  // Strategy 2: Fast polling fallback (500ms)
   for (let attempt = 1; attempt <= 20; attempt++) {
     await new Promise(r => setTimeout(r, 500));
     try {
@@ -186,15 +192,11 @@ async function vidssaveQueryDownload(taskId) {
   throw new Error('SSE polling timed out');
 }
 
-/** Get download URL for a single resource */
-async function getDownloadUrl(resource) {
-  if (resource.download_url && resource.download_mode === 'check_download') {
-    return { url: resource.download_url, filesize: resource.size || 0, isDirect: true };
-  }
-  if (!resource.resource_content) throw new Error(`No resource_content for ${resource.quality}`);
-  const taskId = await vidssaveDownload(resource.resource_content);
+/** Resolve a resourceContent → download URL (steps 2+3) */
+async function resolveResourceContent(resourceContent) {
+  const taskId = await vidssaveDownload(resourceContent);
   const result = await vidssaveQueryDownload(taskId);
-  return { url: result.downloadLink, filesize: result.filesize || resource.size || 0, isDirect: false };
+  return result;
 }
 
 // ─── Express App ──────────────────────────────────────────────────────────────
@@ -206,28 +208,28 @@ app.use(cors());
 app.get('/', (req, res) => {
   res.json({
     service: 'YouTube Download API',
-    version: '2.0.0',
+    version: '3.0.0',
     source: 'vidssave.com API + Webshare rotating proxy',
+    flow: 'Exactly like vidssave.com frontend:',
     how_it_works: {
-      step1_parse: 'POST media/parse → video info + all formats (FAST: ~1-2s)',
-      step2_download: 'POST media/download → task_id (needed for 1080p/720p/480p only)',
-      step3_query: 'GET media/download_query → SSE stream → download_link',
-      direct_urls: '360P, 128KBPS audio, 48KBPS audio get direct googlevideo URLs from step 1 (instant)',
+      'Step 1 — /parse?url=<YT>': 'FAST (~1-2s) → all formats. Some have direct downloadUrl already (360P, audio). Others return resourceContent token.',
+      'Step 2 — /resolve?rc=<token>': 'Takes resourceContent from Step 1 (~4-7s) → returns downloadUrl. Call for each non-direct format.',
+      'One-shot — /download?url=<YT>&quality=1080p': 'Does both steps internally. Slower but single request.',
+      'Stream — /stream?url=<YT>&quality=1080p': 'Parse + resolve + download through proxy + stream back. For vidssave CDN URLs (IP-bound to proxy).',
     },
     endpoints: {
-      'GET /parse?url=<YT_URL>': 'FAST (~1-2s) — parse only, returns all formats + direct URLs',
-      'GET /download?url=<YT_URL>&quality=1080p': 'Get download URL for quality (~4-7s for 1080p, ~1-2s for 360p)',
-      'GET /download-all?url=<YT_URL>': 'Get ALL download URLs (slow — fetches each)',
+      'GET /parse?url=<YT_URL>': 'FAST (~1-2s) — parse only, returns all formats + direct URLs + resourceContent tokens',
+      'GET /resolve?rc=<resourceContent>': 'Resolve a resourceContent token → download URL (~4-7s)',
+      'GET /download?url=<YT_URL>&quality=1080p': 'One-shot: parse + resolve for specific quality',
+      'GET /download-all?url=<YT_URL>': 'One-shot: parse + resolve ALL qualities (slow)',
+      'GET /stream?url=<YT_URL>&quality=1080p&filename=video.mp4': 'Parse + resolve + download through proxy + stream file back',
     },
     qualities: ['1080p', '720p', '480p', '360p', '240p', '144p', 'audio', 'mp3'],
-    example: 'GET /parse?url=https://youtu.be/v5LlVB3fqjY',
   });
 });
 
 /**
  * GET /parse?url=<YT_URL>
- * FAST: ~1-2s — returns all video info + formats from the parse API directly.
- * Some formats (360P, audio) already have direct download URLs.
  */
 app.get('/parse', asyncHandler(async (req, res) => {
   const { url } = req.query;
@@ -256,20 +258,47 @@ app.get('/parse', asyncHandler(async (req, res) => {
       format: r.format,
       sizeBytes: r.size || 0,
       sizeMB: formatSize(r.size),
-      downloadMode: r.download_mode || null,
-      // Direct URLs already available (360P, audio) — no extra request needed
       downloadUrl: (r.download_url && r.download_mode === 'check_download') ? r.download_url : null,
-      // resource_content is needed for step 2 to get download URL for non-direct formats
       resourceContent: r.resource_content || null,
     })),
   });
 }));
 
 /**
+ * GET /resolve?rc=<resourceContent>
+ */
+app.get('/resolve', asyncHandler(async (req, res) => {
+  const { rc } = req.query;
+  if (!rc) return res.status(400).json({ error: 'Missing ?rc=<resourceContent> — get it from /parse response' });
+
+  const result = await resolveResourceContent(rc);
+  res.json({
+    downloadUrl: result.downloadLink,
+    filesize: result.filesize || 0,
+    sizeMB: formatSize(result.filesize),
+  });
+}));
+
+/**
+ * POST /resolve
+ */
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: true, limit: '10kb' }));
+
+app.post('/resolve', asyncHandler(async (req, res) => {
+  const rc = req.body.rc || req.body.resourceContent || req.query.rc;
+  if (!rc) return res.status(400).json({ error: 'Missing resourceContent — send as { rc: "..." } or ?rc=...' });
+
+  const result = await resolveResourceContent(rc);
+  res.json({
+    downloadUrl: result.downloadLink,
+    filesize: result.filesize || 0,
+    sizeMB: formatSize(result.filesize),
+  });
+}));
+
+/**
  * GET /download?url=<YT_URL>&quality=1080p
- * Gets download URL for a specific quality.
- * - 360P, audio: FAST (~1-2s, direct URL from parse)
- * - 1080P, 720P, 480P: SLOW (~4-7s, needs download + SSE flow)
  */
 app.get('/download', asyncHandler(async (req, res) => {
   const { url, quality = '1080p' } = req.query;
@@ -296,24 +325,40 @@ app.get('/download', asyncHandler(async (req, res) => {
                    resources.find(r => r.quality === targetQuality && r.type === 'audio');
   if (!resource) return res.status(404).json({ error: `Quality ${quality} not available. Available: ${resources.map(r => r.quality).join(', ')}` });
 
-  const dlResult = await getDownloadUrl(resource);
+  if (resource.download_url && resource.download_mode === 'check_download') {
+    return res.json({
+      id: parsed.id || videoId,
+      title: parsed.title,
+      duration: formatDuration(parsed.duration),
+      quality: targetQuality,
+      downloadUrl: resource.download_url,
+      sizeMB: formatSize(resource.size),
+      isDirectUrl: true,
+    });
+  }
+
+  if (!resource.resource_content) return res.status(400).json({ error: `No resource_content for ${targetQuality}` });
+  const dlResult = await resolveResourceContent(resource.resource_content);
   const result = {
     id: parsed.id || videoId,
     title: parsed.title,
     duration: formatDuration(parsed.duration),
     quality: targetQuality,
-    downloadUrl: dlResult.url,
-    sizeMB: formatSize(dlResult.filesize),
-    isDirectUrl: dlResult.isDirect,
+    downloadUrl: dlResult.downloadLink,
+    sizeMB: formatSize(dlResult.filesize || resource.size),
+    isDirectUrl: false,
   };
 
-  // For video-only formats (1080P/720P/480P), also get audio URL
   if (resource.type === 'video' && !['360P', '240P', '144P'].includes(targetQuality)) {
     const audioResource = resources.find(r => r.quality === '128KBPS' && r.type === 'audio');
     if (audioResource) {
       try {
-        const audioResult = await getDownloadUrl(audioResource);
-        result.audioUrl = audioResult.url;
+        if (audioResource.download_url && audioResource.download_mode === 'check_download') {
+          result.audioUrl = audioResource.download_url;
+        } else if (audioResource.resource_content) {
+          const audioResult = await resolveResourceContent(audioResource.resource_content);
+          result.audioUrl = audioResult.downloadLink;
+        }
         result.mergeTip = 'ffmpeg -i video.mp4 -i audio.mp3 -c copy output.mp4';
       } catch (e) {
         result.audioError = e.message;
@@ -326,7 +371,6 @@ app.get('/download', asyncHandler(async (req, res) => {
 
 /**
  * GET /download-all?url=<YT_URL>
- * Gets ALL download URLs. Slow because it fetches each one.
  */
 app.get('/download-all', asyncHandler(async (req, res) => {
   const { url } = req.query;
@@ -344,8 +388,14 @@ app.get('/download-all', asyncHandler(async (req, res) => {
 
   for (const r of resources) {
     try {
-      const dl = await getDownloadUrl(r);
-      results.downloads[r.quality] = { url: dl.url, sizeMB: formatSize(dl.filesize), isDirect: dl.isDirect, type: r.type };
+      if (r.download_url && r.download_mode === 'check_download') {
+        results.downloads[r.quality] = { url: r.download_url, sizeMB: formatSize(r.size), isDirect: true, type: r.type };
+      } else if (r.resource_content) {
+        const dl = await resolveResourceContent(r.resource_content);
+        results.downloads[r.quality] = { url: dl.downloadLink, sizeMB: formatSize(dl.filesize || r.size), isDirect: false, type: r.type };
+      } else {
+        results.downloads[r.quality] = { error: 'No download method', type: r.type };
+      }
     } catch (e) {
       results.downloads[r.quality] = { error: e.message, type: r.type };
     }
@@ -354,13 +404,119 @@ app.get('/download-all', asyncHandler(async (req, res) => {
   res.json(results);
 }));
 
+/**
+ * GET /stream?url=<YT_URL>&quality=1080p&filename=video.mp4
+ * One-shot: parse + resolve + stream the actual video file through proxy.
+ * 
+ * vidssave CDN URLs are IP-bound to the proxy IP — only the proxy can download them.
+ * This endpoint fetches the file through the proxy and streams it back to the caller.
+ */
+app.get('/stream', asyncHandler(async (req, res) => {
+  const { url, quality = '1080p', filename } = req.query;
+  if (!url) return res.status(400).json({ error: 'Missing ?url=' });
+  const videoId = extractVideoId(url);
+  if (!videoId) return res.status(400).json({ error: 'Invalid YouTube URL' });
+
+  const fullUrl = normalizeUrl(url);
+  const cacheKey = `parse:${fullUrl}`;
+  let parsed = cacheGet(cacheKey);
+  if (!parsed) {
+    parsed = await vidssaveParse(fullUrl);
+    cacheSet(cacheKey, parsed);
+  }
+
+  const resources = parsed.resources || [];
+  const qualityMap = {
+    '1080P':'1080P','720P':'720P','480P':'480P','360P':'360P',
+    '240P':'240P','144P':'144P','AUDIO':'128KBPS','MP3':'128KBPS',
+    'M4A':'128KBPS','128KBPS':'128KBPS','256KBPS':'256KBPS','48KBPS':'48KBPS',
+  };
+  const targetQuality = qualityMap[quality.toUpperCase().replace('P','P')] || quality.toUpperCase();
+  const resource = resources.find(r => r.quality === targetQuality && r.type === 'video') ||
+                   resources.find(r => r.quality === targetQuality && r.type === 'audio');
+  if (!resource) return res.status(404).json({ error: `Quality ${quality} not available` });
+
+  // Step 1: Get the download URL (direct or resolved)
+  let downloadUrl;
+  let isVidssaveCDN = false;
+
+  if (resource.download_url && resource.download_mode === 'check_download') {
+    // Direct googlevideo URL — can redirect browser directly
+    downloadUrl = resource.download_url;
+  } else if (resource.resource_content) {
+    // Need to resolve through vidssave API → get vidssave CDN URL
+    const dlResult = await resolveResourceContent(resource.resource_content);
+    downloadUrl = dlResult.downloadLink;
+    isVidssaveCDN = downloadUrl && downloadUrl.includes('vidssave.com');
+  } else {
+    return res.status(400).json({ error: 'No download method available' });
+  }
+
+  if (!downloadUrl) return res.status(502).json({ error: 'Failed to get download URL' });
+
+  const safeFilename = filename || `youtube-${videoId}-${targetQuality}.${resource.type === 'audio' ? 'mp3' : 'mp4'}`;
+
+  // For googlevideo direct URLs: redirect browser (no proxy bandwidth)
+  if (!isVidssaveCDN && downloadUrl.includes('googlevideo.com')) {
+    return res.redirect(downloadUrl);
+  }
+
+  // For vidssave CDN URLs: must download through proxy (IP-bound to proxy)
+  console.log(`[Stream] Fetching ${targetQuality} through proxy: ${downloadUrl.substring(0, 80)}...`);
+
+  const streamHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+    'Referer': 'https://vidssave.com/',
+    'Origin': 'https://vidssave.com',
+    'Accept': '*/*',
+  };
+
+  const rangeHeader = req.headers['range'];
+  if (rangeHeader) streamHeaders['Range'] = rangeHeader;
+
+  const upstream = await fetchWithTimeout(downloadUrl, {
+    headers: streamHeaders,
+    agent: getProxyAgent(),
+    redirect: 'follow',
+  }, 120000);
+
+  if (!upstream.ok && upstream.status !== 206) {
+    console.error(`[Stream] Upstream ${upstream.status} for ${downloadUrl.substring(0, 80)}`);
+    return res.status(upstream.status >= 400 && upstream.status < 500 ? upstream.status : 502)
+      .json({ error: `Download failed: HTTP ${upstream.status}. Link may have expired.` });
+  }
+
+  // Stream the file back with proper headers
+  const contentType = upstream.headers.get('content-type');
+  const contentLength = upstream.headers.get('content-length');
+  const contentRange = upstream.headers.get('content-range');
+
+  res.setHeader('Content-Type', contentType || 'video/mp4');
+  if (contentLength) res.setHeader('Content-Length', contentLength);
+  if (contentRange) res.setHeader('Content-Range', contentRange);
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeFilename)}"`);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges, Content-Disposition');
+  res.setHeader('Cache-Control', 'public, max-age=300');
+
+  res.status(upstream.status);
+
+  // Pipe the stream
+  upstream.body.pipe(res);
+
+  req.on('close', () => {
+    try { upstream.body.destroy(); } catch (e) {}
+  });
+}));
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   const proxyHost = PROXY_URL.includes('@') ? PROXY_URL.split('@')[1] : PROXY_URL;
-  console.log('=== YouTube Download API v2 ===');
+  console.log('=== YouTube Download API v3 ===');
   console.log('Port:', PORT, '| Proxy:', proxyHost);
+  console.log('Flow: /parse (fast) → /resolve (per format) → /stream (proxy download)');
   console.log('Ready!');
 });
 
-// Keep event loop alive (proxy agent sockets close after requests)
 setInterval(() => {}, 60000);
