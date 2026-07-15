@@ -1,25 +1,9 @@
 #!/usr/bin/env node
 /**
- * YouTube Download API — Node.js / Express v3
- *
- * Mirrors vidssave.com's actual frontend flow:
- *
- *   Step 1: /parse?url=<YT_URL>  (FAST ~1-2s)
- *     → Returns all formats. Some already have direct downloadUrl (360P, audio).
- *     → Non-direct formats return a resourceContent token instead.
- *
- *   Step 2: /resolve?rc=<resourceContent>  (~4-7s)
- *     → Takes the resourceContent from Step 1, does download+SSE flow.
- *     → Returns the final downloadUrl.
- *
- *   One-shot: /download?url=<YT_URL>&quality=1080p
- *     → Does both steps internally. Slower but single request.
- *
- *   Stream: /stream?url=<YT_URL>&quality=1080p&filename=video.mp4
- *     → Does parse + resolve + download through proxy + stream back.
- *     → vidssave CDN URLs are IP-bound to proxy, so only this endpoint can download them.
- *
- * Uses Webshare rotating proxy to bypass IP blocks.
+ * YouTube Download API — Node.js / Express v3.1
+ * 
+ * FIX: Uses sticky proxy sessions so the same IP is used for
+ * both resolving and downloading vidssave CDN URLs.
  */
 
 const express = require('express');
@@ -65,7 +49,60 @@ const BROWSER_HEADERS = {
   'Sec-Fetch-Site': 'same-site',
 };
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Sticky Proxy Session ─────────────────────────────────────────────────────
+// Webshare sticky proxy format:
+//   http://username-session-XXXXXX:password@p.webshare.io:80
+// The -session-XXXXXX part keeps the same IP for all requests with that session ID.
+// Session lasts up to 30 minutes on Webshare.
+
+/**
+ * Generate a sticky proxy URL with a random session ID.
+ * All requests using the same session ID will go through the same proxy IP.
+ */
+function createStickySession() {
+  // Parse proxy URL: http://user:pass@host:port
+  const match = PROXY_URL.match(/^(https?):\/\/([^:]+):([^@]+)@(.+)$/);
+  if (!match) {
+    // Can't parse — return original (might not be rotating, that's OK)
+    return { proxyUrl: PROXY_URL, sessionId: 'default' };
+  }
+  const [, protocol, user, pass, host] = match;
+  const sessionId = Math.random().toString(36).substring(2, 10);
+  
+  // Build sticky proxy URL: replace -rotate with -rotate-session-XXXXXX
+  let stickyUser;
+  if (user.includes('-rotate')) {
+    stickyUser = user.replace('-rotate', `-rotate-session-${sessionId}`);
+  } else {
+    stickyUser = `${user}-session-${sessionId}`;
+  }
+  
+  return {
+    proxyUrl: `${protocol}://${stickyUser}:${pass}@${host}`,
+    sessionId,
+  };
+}
+
+/**
+ * Create a proxy agent for a specific session.
+ * All calls using this agent will go through the same proxy IP.
+ */
+function getStickyProxyAgent(sessionId) {
+  const match = PROXY_URL.match(/^(https?):\/\/([^:]+):([^@]+)@(.+)$/);
+  if (!match) return new HttpsProxyAgent(PROXY_URL);
+  
+  const [, protocol, user, pass, host] = match;
+  let stickyUser;
+  if (user.includes('-rotate')) {
+    stickyUser = user.replace('-rotate', `-rotate-session-${sessionId}`);
+  } else {
+    stickyUser = `${user}-session-${sessionId}`;
+  }
+  
+  return new HttpsProxyAgent(`${protocol}://${stickyUser}:${pass}@${host}`);
+}
+
+// Old rotating proxy (for non-critical calls like parse)
 function getProxyAgent() { return new HttpsProxyAgent(PROXY_URL); }
 
 async function fetchWithTimeout(url, options, timeoutMs = 25000) {
@@ -138,7 +175,76 @@ async function vidssaveParse(ytUrl) {
   throw new Error(data.msg || 'Parse failed');
 }
 
-/** Step 2: Request download → task_id */
+/**
+ * Step 2+3: Resolve resourceContent → download URL
+ * Uses sticky proxy so the same IP resolves AND downloads the CDN file.
+ */
+async function vidssaveResolveWithStickyProxy(resourceContent) {
+  // Create a sticky session — same IP for all calls below
+  const { sessionId } = createStickySession();
+  const agent = getStickyProxyAgent(sessionId);
+  
+  console.log(`[Sticky] Using session ${sessionId} for resolve+download`);
+
+  // Step 2: Request download → task_id
+  const body = 'auth=' + AUTH + '&domain=' + DOMAIN + '&request=' + encodeURIComponent(resourceContent) + '&no_encrypt=1';
+  const dlResp = await fetchWithTimeout(`${VIDSSAVE_API}/media/download`, {
+    method: 'POST',
+    headers: { ...BROWSER_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+    agent,
+  }, 30000);
+  const dlData = await dlResp.json();
+  if (!(dlData.status === 1 && dlData.data && dlData.data.task_id)) {
+    throw new Error(dlData.msg || 'Download request failed');
+  }
+  const taskId = dlData.data.task_id;
+
+  // Step 3: Query download → get download_link
+  const queryUrl = `${VIDSSAVE_API}/media/download_query?auth=${AUTH}&domain=${DOMAIN}&task_id=${encodeURIComponent(taskId)}&download_domain=vidssave.com&origin=content_site`;
+
+  // Try SSE stream first
+  try {
+    const resp = await fetchWithTimeout(queryUrl, { headers: { ...BROWSER_HEADERS }, agent }, 30000);
+    const text = await resp.text();
+    if (text.includes('download_link')) {
+      const match = text.match(/"download_link"\s*:\s*"([^"]+)"/);
+      if (match) return { downloadLink: match[1], filesize: 0, sessionId };
+      try {
+        const json = JSON.parse(text.replace(/^event:.*\n/gm, '').replace(/^data:\s*/gm, ''));
+        if (json.data && json.data.download_link) return { downloadLink: json.data.download_link, filesize: json.data.filesize || 0, sessionId };
+      } catch (e) {}
+    }
+  } catch (err) {
+    console.warn('[SSE stream] failed:', err.message);
+  }
+
+  // Polling fallback
+  for (let attempt = 1; attempt <= 20; attempt++) {
+    await new Promise(r => setTimeout(r, 500));
+    try {
+      const resp = await fetchWithTimeout(queryUrl, { headers: { ...BROWSER_HEADERS }, agent }, 10000);
+      const text = await resp.text();
+      if (text.includes('download_link')) {
+        const match = text.match(/"download_link"\s*:\s*"([^"]+)"/);
+        if (match) return { downloadLink: match[1], filesize: 0, sessionId };
+        try {
+          const json = JSON.parse(text);
+          if (json.data && json.data.download_link) return { downloadLink: json.data.download_link, filesize: json.data.filesize || 0, sessionId };
+        } catch (e) {}
+      }
+    } catch (err) {}
+  }
+  throw new Error('SSE polling timed out');
+}
+
+/** Old resolve (non-sticky) — for /resolve endpoint only */
+async function resolveResourceContent(resourceContent) {
+  const taskId = await vidssaveDownload(resourceContent);
+  const result = await vidssaveQueryDownload(taskId);
+  return result;
+}
+
 async function vidssaveDownload(resourceContent) {
   const body = 'auth=' + AUTH + '&domain=' + DOMAIN + '&request=' + encodeURIComponent(resourceContent) + '&no_encrypt=1';
   const resp = await fetchWithTimeout(`${VIDSSAVE_API}/media/download`, {
@@ -152,15 +258,10 @@ async function vidssaveDownload(resourceContent) {
   throw new Error(data.msg || 'Download request failed');
 }
 
-/** Step 3: Read SSE stream → download_link */
 async function vidssaveQueryDownload(taskId) {
   const queryUrl = `${VIDSSAVE_API}/media/download_query?auth=${AUTH}&domain=${DOMAIN}&task_id=${encodeURIComponent(taskId)}&download_domain=vidssave.com&origin=content_site`;
-
   try {
-    const resp = await fetchWithTimeout(queryUrl, {
-      headers: { ...BROWSER_HEADERS },
-      agent: getProxyAgent(),
-    }, 30000);
+    const resp = await fetchWithTimeout(queryUrl, { headers: { ...BROWSER_HEADERS }, agent: getProxyAgent() }, 30000);
     const text = await resp.text();
     if (text.includes('download_link')) {
       const match = text.match(/"download_link"\s*:\s*"([^"]+)"/);
@@ -173,7 +274,6 @@ async function vidssaveQueryDownload(taskId) {
   } catch (err) {
     console.warn('[SSE stream] failed:', err.message);
   }
-
   for (let attempt = 1; attempt <= 20; attempt++) {
     await new Promise(r => setTimeout(r, 500));
     try {
@@ -192,13 +292,6 @@ async function vidssaveQueryDownload(taskId) {
   throw new Error('SSE polling timed out');
 }
 
-/** Resolve a resourceContent → download URL (steps 2+3) */
-async function resolveResourceContent(resourceContent) {
-  const taskId = await vidssaveDownload(resourceContent);
-  const result = await vidssaveQueryDownload(taskId);
-  return result;
-}
-
 // ─── Express App ──────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
@@ -208,23 +301,15 @@ app.use(cors());
 app.get('/', (req, res) => {
   res.json({
     service: 'YouTube Download API',
-    version: '3.0.0',
-    source: 'vidssave.com API + Webshare rotating proxy',
-    flow: 'Exactly like vidssave.com frontend:',
-    how_it_works: {
-      'Step 1 — /parse?url=<YT>': 'FAST (~1-2s) → all formats. Some have direct downloadUrl already (360P, audio). Others return resourceContent token.',
-      'Step 2 — /resolve?rc=<token>': 'Takes resourceContent from Step 1 (~4-7s) → returns downloadUrl. Call for each non-direct format.',
-      'One-shot — /download?url=<YT>&quality=1080p': 'Does both steps internally. Slower but single request.',
-      'Stream — /stream?url=<YT>&quality=1080p': 'Parse + resolve + download through proxy + stream back. For vidssave CDN URLs (IP-bound to proxy).',
-    },
+    version: '3.1.0',
+    source: 'vidssave.com API + Webshare sticky proxy',
     endpoints: {
-      'GET /parse?url=<YT_URL>': 'FAST (~1-2s) — parse only, returns all formats + direct URLs + resourceContent tokens',
-      'GET /resolve?rc=<resourceContent>': 'Resolve a resourceContent token → download URL (~4-7s)',
-      'GET /download?url=<YT_URL>&quality=1080p': 'One-shot: parse + resolve for specific quality',
-      'GET /download-all?url=<YT_URL>': 'One-shot: parse + resolve ALL qualities (slow)',
-      'GET /stream?url=<YT_URL>&quality=1080p&filename=video.mp4': 'Parse + resolve + download through proxy + stream file back',
+      'GET /parse?url=<YT_URL>': 'Parse — returns all formats',
+      'GET /resolve?rc=<token>': 'Resolve resourceContent → download URL',
+      'GET /download?url=<YT>&quality=1080p': 'One-shot: parse + resolve',
+      'GET /download-all?url=<YT>': 'Parse + resolve ALL qualities',
+      'GET /stream?url=<YT>&quality=1080p': 'Parse + resolve + stream through proxy (sticky session)',
     },
-    qualities: ['1080p', '720p', '480p', '360p', '240p', '144p', 'audio', 'mp3'],
   });
 });
 
@@ -269,32 +354,19 @@ app.get('/parse', asyncHandler(async (req, res) => {
  */
 app.get('/resolve', asyncHandler(async (req, res) => {
   const { rc } = req.query;
-  if (!rc) return res.status(400).json({ error: 'Missing ?rc=<resourceContent> — get it from /parse response' });
-
+  if (!rc) return res.status(400).json({ error: 'Missing ?rc=<resourceContent>' });
   const result = await resolveResourceContent(rc);
-  res.json({
-    downloadUrl: result.downloadLink,
-    filesize: result.filesize || 0,
-    sizeMB: formatSize(result.filesize),
-  });
+  res.json({ downloadUrl: result.downloadLink, filesize: result.filesize || 0, sizeMB: formatSize(result.filesize) });
 }));
 
-/**
- * POST /resolve
- */
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 
 app.post('/resolve', asyncHandler(async (req, res) => {
   const rc = req.body.rc || req.body.resourceContent || req.query.rc;
-  if (!rc) return res.status(400).json({ error: 'Missing resourceContent — send as { rc: "..." } or ?rc=...' });
-
+  if (!rc) return res.status(400).json({ error: 'Missing resourceContent' });
   const result = await resolveResourceContent(rc);
-  res.json({
-    downloadUrl: result.downloadLink,
-    filesize: result.filesize || 0,
-    sizeMB: formatSize(result.filesize),
-  });
+  res.json({ downloadUrl: result.downloadLink, filesize: result.filesize || 0, sizeMB: formatSize(result.filesize) });
 }));
 
 /**
@@ -309,10 +381,7 @@ app.get('/download', asyncHandler(async (req, res) => {
   const fullUrl = normalizeUrl(url);
   const cacheKey = `parse:${fullUrl}`;
   let parsed = cacheGet(cacheKey);
-  if (!parsed) {
-    parsed = await vidssaveParse(fullUrl);
-    cacheSet(cacheKey, parsed);
-  }
+  if (!parsed) { parsed = await vidssaveParse(fullUrl); cacheSet(cacheKey, parsed); }
 
   const resources = parsed.resources || [];
   const qualityMap = {
@@ -326,19 +395,13 @@ app.get('/download', asyncHandler(async (req, res) => {
   if (!resource) return res.status(404).json({ error: `Quality ${quality} not available. Available: ${resources.map(r => r.quality).join(', ')}` });
 
   if (resource.download_url && resource.download_mode === 'check_download') {
-    return res.json({
-      id: parsed.id || videoId,
-      title: parsed.title,
-      duration: formatDuration(parsed.duration),
-      quality: targetQuality,
-      downloadUrl: resource.download_url,
-      sizeMB: formatSize(resource.size),
-      isDirectUrl: true,
-    });
+    return res.json({ id: parsed.id || videoId, title: parsed.title, duration: formatDuration(parsed.duration), quality: targetQuality, downloadUrl: resource.download_url, sizeMB: formatSize(resource.size), isDirectUrl: true });
   }
 
   if (!resource.resource_content) return res.status(400).json({ error: `No resource_content for ${targetQuality}` });
-  const dlResult = await resolveResourceContent(resource.resource_content);
+
+  // Use sticky proxy for resolve
+  const dlResult = await vidssaveResolveWithStickyProxy(resource.resource_content);
   const result = {
     id: parsed.id || videoId,
     title: parsed.title,
@@ -356,13 +419,11 @@ app.get('/download', asyncHandler(async (req, res) => {
         if (audioResource.download_url && audioResource.download_mode === 'check_download') {
           result.audioUrl = audioResource.download_url;
         } else if (audioResource.resource_content) {
-          const audioResult = await resolveResourceContent(audioResource.resource_content);
+          const audioResult = await vidssaveResolveWithStickyProxy(audioResource.resource_content);
           result.audioUrl = audioResult.downloadLink;
         }
         result.mergeTip = 'ffmpeg -i video.mp4 -i audio.mp3 -c copy output.mp4';
-      } catch (e) {
-        result.audioError = e.message;
-      }
+      } catch (e) { result.audioError = e.message; }
     }
   }
 
@@ -391,7 +452,7 @@ app.get('/download-all', asyncHandler(async (req, res) => {
       if (r.download_url && r.download_mode === 'check_download') {
         results.downloads[r.quality] = { url: r.download_url, sizeMB: formatSize(r.size), isDirect: true, type: r.type };
       } else if (r.resource_content) {
-        const dl = await resolveResourceContent(r.resource_content);
+        const dl = await vidssaveResolveWithStickyProxy(r.resource_content);
         results.downloads[r.quality] = { url: dl.downloadLink, sizeMB: formatSize(dl.filesize || r.size), isDirect: false, type: r.type };
       } else {
         results.downloads[r.quality] = { error: 'No download method', type: r.type };
@@ -406,10 +467,9 @@ app.get('/download-all', asyncHandler(async (req, res) => {
 
 /**
  * GET /stream?url=<YT_URL>&quality=1080p&filename=video.mp4
- * One-shot: parse + resolve + stream the actual video file through proxy.
  * 
- * vidssave CDN URLs are IP-bound to the proxy IP — only the proxy can download them.
- * This endpoint fetches the file through the proxy and streams it back to the caller.
+ * KEY FIX: Uses sticky proxy session so the same IP resolves the download URL
+ * AND downloads the CDN file. vidssave CDN sign is IP-bound.
  */
 app.get('/stream', asyncHandler(async (req, res) => {
   const { url, quality = '1080p', filename } = req.query;
@@ -436,33 +496,35 @@ app.get('/stream', asyncHandler(async (req, res) => {
                    resources.find(r => r.quality === targetQuality && r.type === 'audio');
   if (!resource) return res.status(404).json({ error: `Quality ${quality} not available` });
 
-  // Step 1: Get the download URL (direct or resolved)
-  let downloadUrl;
-  let isVidssaveCDN = false;
-
+  // Direct googlevideo URL — redirect browser (no proxy needed)
   if (resource.download_url && resource.download_mode === 'check_download') {
-    // Direct googlevideo URL — can redirect browser directly
-    downloadUrl = resource.download_url;
-  } else if (resource.resource_content) {
-    // Need to resolve through vidssave API → get vidssave CDN URL
-    const dlResult = await resolveResourceContent(resource.resource_content);
-    downloadUrl = dlResult.downloadLink;
-    isVidssaveCDN = downloadUrl && downloadUrl.includes('vidssave.com');
-  } else {
-    return res.status(400).json({ error: 'No download method available' });
+    return res.redirect(resource.download_url);
   }
+
+  if (!resource.resource_content) return res.status(400).json({ error: 'No download method available' });
+
+  // ─── Sticky proxy session: same IP for resolve + download ────
+  const { sessionId } = createStickySession();
+  const stickyAgent = getStickyProxyAgent(sessionId);
+
+  console.log(`[Stream] Using sticky session ${sessionId} for ${targetQuality}`);
+
+  // Resolve through sticky proxy (same IP)
+  const dlResult = await vidssaveResolveWithStickyProxy(resource.resource_content);
+  const downloadUrl = dlResult.downloadLink;
+  const isVidssaveCDN = downloadUrl && downloadUrl.includes('vidssave.com');
 
   if (!downloadUrl) return res.status(502).json({ error: 'Failed to get download URL' });
 
-  const safeFilename = filename || `youtube-${videoId}-${targetQuality}.${resource.type === 'audio' ? 'mp3' : 'mp4'}`;
-
-  // For googlevideo direct URLs: redirect browser (no proxy bandwidth)
+  // googlevideo URL from resolve — redirect directly
   if (!isVidssaveCDN && downloadUrl.includes('googlevideo.com')) {
     return res.redirect(downloadUrl);
   }
 
-  // For vidssave CDN URLs: must download through proxy (IP-bound to proxy)
-  console.log(`[Stream] Fetching ${targetQuality} through proxy: ${downloadUrl.substring(0, 80)}...`);
+  const safeFilename = filename || `youtube-${videoId}-${targetQuality}.${resource.type === 'audio' ? 'mp3' : 'mp4'}`;
+
+  // Download CDN file through the SAME sticky proxy IP that resolved it
+  console.log(`[Stream] Downloading ${targetQuality} via sticky session ${sessionId}: ${downloadUrl.substring(0, 80)}...`);
 
   const streamHeaders = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
@@ -474,9 +536,13 @@ app.get('/stream', asyncHandler(async (req, res) => {
   const rangeHeader = req.headers['range'];
   if (rangeHeader) streamHeaders['Range'] = rangeHeader;
 
+  // Use the SAME sticky agent that resolved the URL
+  const resolveSessionId = dlResult.sessionId;
+  const downloadAgent = resolveSessionId ? getStickyProxyAgent(resolveSessionId) : stickyAgent;
+
   const upstream = await fetchWithTimeout(downloadUrl, {
     headers: streamHeaders,
-    agent: getProxyAgent(),
+    agent: downloadAgent,
     redirect: 'follow',
   }, 120000);
 
@@ -486,7 +552,7 @@ app.get('/stream', asyncHandler(async (req, res) => {
       .json({ error: `Download failed: HTTP ${upstream.status}. Link may have expired.` });
   }
 
-  // Stream the file back with proper headers
+  // Stream back with proper headers
   const contentType = upstream.headers.get('content-type');
   const contentLength = upstream.headers.get('content-length');
   const contentRange = upstream.headers.get('content-range');
@@ -501,8 +567,6 @@ app.get('/stream', asyncHandler(async (req, res) => {
   res.setHeader('Cache-Control', 'public, max-age=300');
 
   res.status(upstream.status);
-
-  // Pipe the stream
   upstream.body.pipe(res);
 
   req.on('close', () => {
@@ -513,9 +577,9 @@ app.get('/stream', asyncHandler(async (req, res) => {
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   const proxyHost = PROXY_URL.includes('@') ? PROXY_URL.split('@')[1] : PROXY_URL;
-  console.log('=== YouTube Download API v3 ===');
+  console.log('=== YouTube Download API v3.1 ===');
   console.log('Port:', PORT, '| Proxy:', proxyHost);
-  console.log('Flow: /parse (fast) → /resolve (per format) → /stream (proxy download)');
+  console.log('FIX: Sticky proxy sessions — same IP for resolve + CDN download');
   console.log('Ready!');
 });
 
