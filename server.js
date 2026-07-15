@@ -37,7 +37,7 @@ process.on('unhandledRejection', (e) => {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8000;
-const PROXY_URL = process.env.PROXY_URL || 'http://qijlkvsz-rotate:viryx2zv5njj@p.webshare.io:80';
+const PROXY_URL = process.env.PROXY_URL || '';
 const API_KEY = process.env.API_KEY || '';
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || '1800', 10); // 30 min
 const SSE_TIMEOUT = parseInt(process.env.SSE_TIMEOUT || '30000', 10); // 30s
